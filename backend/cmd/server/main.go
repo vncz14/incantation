@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/websocket/v2"
 
 	"entgo.io/ent/dialect"
@@ -12,6 +13,9 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 
 	"github.com/vncz14/incantation/backend/ent"
+	"github.com/vncz14/incantation/backend/ent/migrate"
+
+	"github.com/vncz14/incantation/backend/handlers"
 )
 
 func main() {
@@ -22,12 +26,26 @@ func main() {
 	}
 	defer client.Close()
 	ctx := context.Background()
-	if err := client.Schema.Create(ctx); err != nil {
+
+	err = client.Schema.Create(
+		ctx,
+		migrate.WithDropIndex(true),
+		migrate.WithDropColumn(true),
+	)
+
+	if err != nil {
 		log.Fatalf("failed creating schema resources: %v", err)
 	}
 
 	// Fiber instance
 	app := fiber.New()
+
+	app.Use(cors.New(cors.Config{
+		AllowOrigins:     "http://localhost:3000",
+		AllowCredentials: true,
+	}))
+
+	handlers.RegisterAuthRoutes(app.Group("/auth"), client)
 
 	// Routes
 	app.Get("/", func(c *fiber.Ctx) error {
