@@ -1,9 +1,18 @@
-import sqlite3
 import argparse
 import csv
 import json
+import re
+import sqlite3
 
-# parts of speech that are valid for our purposes
+
+def load_lines_from_file_as_set(filename):
+    with open(filename, "r", encoding="utf-8") as f:
+        return set([line.strip() for line in f if line.strip()])
+
+
+PREFIXES = load_lines_from_file_as_set("prefixes.txt")
+SUFFIXES = load_lines_from_file_as_set("suffixes.txt")
+
 VALID_POS = set(
     [
         "adj",
@@ -20,6 +29,31 @@ VALID_POS = set(
     ]
 )
 
+UNLESS_IRREGULAR_INVALID_TAGS = set(
+    [
+        "form-of",
+        "plural",
+    ]
+)
+
+OTHER_INVALID_TAGS = set(
+    [
+        "slang",
+        "dialectical",
+        "vulgar",
+        "obsolete",
+        "alt-of",
+        "abbreviation",
+        "humorous",
+        "nonstandard",
+        "informal",
+        "Internet",
+    ]
+)
+
+
+INVALID_CATEGORIES = set(["Furry fandom", "Paraphilias"])
+
 
 def does_table_exist(conn, table_name):
     cursor = conn.cursor()
@@ -30,19 +64,21 @@ def does_table_exist(conn, table_name):
 
 
 def create_ngram_table(conn, frequency_file):
-    cursor = conn.cursor()
-
     if does_table_exist(conn, "frequency"):
-        print("frequency table already")
+        print("frequency table already exists")
         return
 
     print("creating frequency table")
 
-    cursor.execute("""
+    cursor = conn.cursor()
+
+    cursor.executescript("""
         CREATE TABLE frequency (
             word TEXT PRIMARY KEY,
             frequency INTEGER NOT NULL
-        )
+        );
+        CREATE INDEX IF NOT EXISTS idx_frequency_word ON frequency(word);
+        CREATE INDEX IF NOT EXISTS idx_frequency_frequency ON frequency(frequency);
     """)
     data = []
     count = 0
@@ -52,21 +88,24 @@ def create_ngram_table(conn, frequency_file):
             if len(row) < 2:
                 continue
             word, freq = row[0], row[1]
-            try:
-                freq = int(freq)
-                data.append((word, freq))
-                count += 1
-                if count % 100000 == 0:
-                    print(f"processed {count} lines of csv")
-                    if count % 1000000 == 0:
-                        print("executing sql statements")
-                        cursor.executemany(
-                            "INSERT INTO frequency (word, frequency) VALUES (?, ?)",
-                            data,
-                        )
+            freq = int(freq)
+            data.append((word, freq))
+            count += 1
+            if count % 100000 == 0:
+                print(f"processed {count} lines of csv")
+                if count % 1000000 == 0:
+                    print("executing sql statements")
+                    cursor.executemany(
+                        "INSERT INTO frequency (word, frequency) VALUES (?, ?)",
+                        data,
+                    )
                     data = []
-            except ValueError:
-                continue
+        if data:
+            print("executing sql statements")
+            cursor.executemany(
+                "INSERT INTO frequency (word, frequency) VALUES (?, ?)",
+                data,
+            )
     conn.commit()
 
 
@@ -79,13 +118,15 @@ def create_wiktionary_table(conn, wiktionary_file):
 
     print("creating wiktionary table")
 
-    cursor.execute("""
+    cursor.executescript("""
         CREATE TABLE wiktionary (
-            word TEXT PRIMARY KEY,
-            definition TEXT NOT NULL,
+            word TEXT NOT NULL,
+            definition TEXT NULL,
+            audio_file_name TEXT NULL,
             is_real_word BOOLEAN NOT NULL DEFAULT 1,
             comments TEXT NULL
-        )
+        );
+        CREATE INDEX IF NOT EXISTS idx_wiktionary_word_isreal ON wiktionary(word, is_real_word);
     """)
 
     with open(wiktionary_file, "r", encoding="utf-8") as f:
@@ -103,14 +144,158 @@ def create_wiktionary_table(conn, wiktionary_file):
             if " " in word:
                 continue
 
+            is_real_word = True
+            definition = None
+            audio_file_name = None
             comments = ""
 
-            if not word or not word.islower() or not word.isalpha():
+            # word is all lowercase ASCII letters
+            if not (word and word.islower() and word.isalpha() and word.isascii()):
                 comments += "not lowercase letters only;"
 
-            # check that the word is a valid part of speech
+            # word is a valid part of speech
             if entry.get("pos") not in VALID_POS:
                 comments += "invalid pos;"
+
+            # word is a trivial prefix or suffix (based on etymology information)
+            etymology_text = entry.get("etymology_text")
+
+            if etymology_text:
+                # remove non-ascii characters
+                etymology_text = re.sub(r"[^\x00-\x7F]+", "", etymology_text)
+
+                prefix_match = re.match(
+                    r"From ([a-z]+\-)\s\+\s([a-z]+)\.", etymology_text
+                )
+                if prefix_match:
+                    prefix, base = prefix_match.groups()
+                    if prefix in PREFIXES:
+                        comments += f"trivial prefix {prefix};"
+                suffix_match = re.match(
+                    r"From ([a-z]+)\s\+\s(\-[a-z]+)\.", etymology_text
+                )
+                if suffix_match:
+                    base, suffix = suffix_match.groups()
+                    if suffix in SUFFIXES:
+                        comments += f"trivial suffix {suffix};"
+
+            # if no comments so far, look for an acceptable sense
+            valid_sense = None
+            first_sense_comments = ""
+            if not comments:
+                senses = entry.get("senses", [])
+                for i, sense in enumerate(senses):
+                    # sense cannot be tagged "form-of" or "plural"
+                    # UNLESS it is
+                    # - an irregular plural
+                    # - an irregular verb form
+                    # - an irregular comparative/superlative
+                    # TODO: make lists using
+                    # - https://en.wiktionary.org/wiki/Category:English_irregular_plurals
+                    # - https://pasttenses.com/irregular-verbs-list
+                    # - manually
+                    # ALSO TODO: if a sense is acceptable, get the definition of its root instead
+
+                    tags = set(sense.get("tags", []))
+
+                    """
+                    other invalid tags - no exceptions
+                    """
+
+                    other_invalid_tags_in_sense = tags.intersection(OTHER_INVALID_TAGS)
+                    if other_invalid_tags_in_sense:
+                        if i == 0:
+                            first_sense_comments += (
+                                f"invalid tags {','.join(other_invalid_tags_in_sense)};"
+                            )
+                        continue
+
+                    """
+                    invalid categories - no exceptions
+                    """
+
+                    categories = set(
+                        category.get("name")
+                        for category in sense.get("categories", [])
+                        if category.get("name") is not None
+                    )
+
+                    invalid_categories_in_sense = categories.intersection(
+                        INVALID_CATEGORIES
+                    )
+
+                    if invalid_categories_in_sense:
+                        if i == 0:
+                            first_sense_comments += f"invalid categories {','.join(invalid_categories_in_sense)};"
+                        continue
+
+                    """
+                    - prefixes and suffixes
+                    - in the etymology information, it cannot say "From [prefix]- +" or "From ... -[suffix]"
+                    - TODO: make list of common prefixes and suffixes
+                        - note to self: command to get common prefixes or suffixes
+                            - grep "prefixed with" kaikki.org-dictionary-English.jsonl | jq | grep "prefixed with" | sort | uniq -c | sort -nr | head -100
+                    """
+
+                    # sense does not have "form-of" field
+                    if sense.get("form-of"):
+                        if i == 0:
+                            first_sense_comments += "form-of field;"
+                        continue
+
+                    # sense is valid
+                    valid_sense = sense
+                    break
+
+            if valid_sense:
+                # gather other fields of the sense
+                definition = " ".join(valid_sense.get("glosses", []))
+
+                audio_file_name = None
+
+                sounds = entry.get("sounds", [])
+                if sounds:
+                    # see if there is an audio file name
+                    # it would be an object in the sounds list with an "audio" field with a value that ends in ".ogg"
+                    for sound in sounds:
+                        if isinstance(sound, dict) and "audio" in sound:
+                            if sound["audio"].endswith(".ogg"):
+                                audio_file_name = sound["audio"]
+                                break
+
+            else:
+                # add comments from the first checked sense to the data
+                is_real_word = False
+                comments += first_sense_comments
+
+            data.append(
+                (
+                    word,
+                    definition,
+                    audio_file_name,
+                    is_real_word,
+                    comments if comments else None,
+                )
+            )
+
+            if count % 10000 == 0:
+                print(f"processed {count} lines")
+                if count % 100000 == 0:
+                    print("executing sql statements")
+                    cursor.executemany(
+                        "INSERT INTO wiktionary (word, definition, audio_file_name, is_real_word, comments) VALUES (?, ?, ?, ?, ?)",
+                        data,
+                    )
+                    data = []
+
+            count += 1
+
+        if data:
+            print("executing sql statements")
+            cursor.executemany(
+                "INSERT INTO wiktionary (word, definition, audio_file_name, is_real_word, comments) VALUES (?, ?, ?, ?, ?)",
+                data,
+            )
 
     conn.commit()
 
@@ -132,6 +317,11 @@ def main():
 
     # create ngram table if it doesn't exist
     create_ngram_table(conn, args.frequency)
+
+    # # drop wiktionary table
+    # if does_table_exist(conn, "wiktionary"):
+    #     print("dropping existing wiktionary table")
+    #     conn.execute("DROP TABLE wiktionary")
 
     # create wiktionary table if it doesn't exist
     create_wiktionary_table(conn, args.wiktionary)
