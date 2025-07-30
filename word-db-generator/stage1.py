@@ -10,8 +10,14 @@ def load_lines_from_file_as_set(filename):
         return set([line.strip() for line in f if line.strip()])
 
 
-PREFIXES = load_lines_from_file_as_set("prefixes.txt")
-SUFFIXES = load_lines_from_file_as_set("suffixes.txt")
+PREFIXES = load_lines_from_file_as_set("lists/prefixes.txt")
+SUFFIXES = load_lines_from_file_as_set("lists/suffixes.txt")
+
+IRREGULAR_PLURALS = load_lines_from_file_as_set("lists/irregular_plurals.txt")
+IRREGULAR_VERBS = load_lines_from_file_as_set("lists/irregular_verbs.txt")
+IRREGULAR_COMPARATIVES_AND_SUPERLATIVES = load_lines_from_file_as_set(
+    "lists/irregular_comparatives_and_superlatives.txt"
+)
 
 VALID_POS = set(
     [
@@ -48,9 +54,9 @@ OTHER_INVALID_TAGS = set(
         "nonstandard",
         "informal",
         "Internet",
+        "archaic",
     ]
 )
-
 
 INVALID_CATEGORIES = set(["Furry fandom", "Paraphilias"])
 
@@ -158,12 +164,17 @@ def create_wiktionary_table(conn, wiktionary_file):
                 comments += "invalid pos;"
 
             # word is a trivial prefix or suffix (based on etymology information)
+            """
+            - note to self: command to get common prefixes or suffixes
+                - grep "prefixed with" kaikki.org-dictionary-English.jsonl | jq | grep "prefixed with" | sort | uniq -c | sort -nr | head -100
+            """
             etymology_text = entry.get("etymology_text")
 
             if etymology_text:
                 # remove non-ascii characters
                 etymology_text = re.sub(r"[^\x00-\x7F]+", "", etymology_text)
 
+                # determine if the etymology text is simply "From [prefix]- + [base]."
                 prefix_match = re.match(
                     r"From ([a-z]+\-)\s\+\s([a-z]+)\.", etymology_text
                 )
@@ -171,6 +182,8 @@ def create_wiktionary_table(conn, wiktionary_file):
                     prefix, base = prefix_match.groups()
                     if prefix in PREFIXES:
                         comments += f"trivial prefix {prefix};"
+
+                # determine if the etymology text is simply "From [base] + -[suffix]."
                 suffix_match = re.match(
                     r"From ([a-z]+)\s\+\s(\-[a-z]+)\.", etymology_text
                 )
@@ -185,18 +198,57 @@ def create_wiktionary_table(conn, wiktionary_file):
             if not comments:
                 senses = entry.get("senses", [])
                 for i, sense in enumerate(senses):
-                    # sense cannot be tagged "form-of" or "plural"
+                    # sense cannot be tagged "form-of" or have a "form-of" field
                     # UNLESS it is
                     # - an irregular plural
                     # - an irregular verb form
                     # - an irregular comparative/superlative
-                    # TODO: make lists using
-                    # - https://en.wiktionary.org/wiki/Category:English_irregular_plurals
-                    # - https://pasttenses.com/irregular-verbs-list
-                    # - manually
-                    # ALSO TODO: if a sense is acceptable, get the definition of its root instead
+                    # TODO: if a sense is acceptable, get the definition of its root instead
 
                     tags = set(sense.get("tags", []))
+
+                    form_of_word = None
+                    form_of = sense.get("form_of")
+                    if form_of:
+                        if isinstance(form_of, list) and len(form_of) >= 1:
+                            form_of_word = form_of[0].get("word")
+
+                    if form_of_word or "form-of" in tags:
+                        exception = False
+
+                        # look for irregular plurals
+                        if "plural" in tags:
+                            if word in IRREGULAR_PLURALS:
+                                exception = True
+                            else:
+                                if i == 0:
+                                    first_sense_comments += "form-of (plural);"
+                                continue
+
+                        # look for irregular verbs
+                        if "verb" in tags:
+                            if form_of_word in IRREGULAR_VERBS:
+                                exception = True
+                            else:
+                                if i == 0:
+                                    first_sense_comments += "form-of (verb);"
+                                continue
+
+                        # look for irregular comparatives and superlatives
+                        if "comparative" in tags or "superlative" in tags:
+                            if form_of_word in IRREGULAR_COMPARATIVES_AND_SUPERLATIVES:
+                                exception = True
+                            else:
+                                if i == 0:
+                                    first_sense_comments += (
+                                        "form-of (comparative/superlative);"
+                                    )
+                                continue
+
+                        if not exception:
+                            if i == 0:
+                                first_sense_comments += "form-of (other);"
+                            continue
 
                     """
                     other invalid tags - no exceptions
@@ -227,20 +279,6 @@ def create_wiktionary_table(conn, wiktionary_file):
                     if invalid_categories_in_sense:
                         if i == 0:
                             first_sense_comments += f"invalid categories {','.join(invalid_categories_in_sense)};"
-                        continue
-
-                    """
-                    - prefixes and suffixes
-                    - in the etymology information, it cannot say "From [prefix]- +" or "From ... -[suffix]"
-                    - TODO: make list of common prefixes and suffixes
-                        - note to self: command to get common prefixes or suffixes
-                            - grep "prefixed with" kaikki.org-dictionary-English.jsonl | jq | grep "prefixed with" | sort | uniq -c | sort -nr | head -100
-                    """
-
-                    # sense does not have "form-of" field
-                    if sense.get("form-of"):
-                        if i == 0:
-                            first_sense_comments += "form-of field;"
                         continue
 
                     # sense is valid
@@ -319,9 +357,9 @@ def main():
     create_ngram_table(conn, args.frequency)
 
     # # drop wiktionary table
-    # if does_table_exist(conn, "wiktionary"):
-    #     print("dropping existing wiktionary table")
-    #     conn.execute("DROP TABLE wiktionary")
+    if does_table_exist(conn, "wiktionary"):
+        print("dropping existing wiktionary table")
+        conn.execute("DROP TABLE wiktionary")
 
     # create wiktionary table if it doesn't exist
     create_wiktionary_table(conn, args.wiktionary)

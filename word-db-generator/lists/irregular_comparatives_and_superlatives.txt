@@ -1,0 +1,8 @@
+good
+well
+bad
+badly
+far
+little
+many
+much    
